@@ -183,19 +183,22 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	events := make(chan *orchestratorv1.WatchTaskEventsResponse, s.sseBuffer)
-	errorsChannel := make(chan error, 1)
+	type streamItem struct {
+		event *orchestratorv1.WatchTaskEventsResponse
+		err   error
+	}
+	items := make(chan streamItem, s.sseBuffer)
 	go func() {
-		defer close(events)
+		defer close(items)
 		for {
 			event, receiveErr := stream.Recv()
-			if receiveErr != nil {
-				errorsChannel <- receiveErr
+			item := streamItem{event: event, err: receiveErr}
+			select {
+			case items <- item:
+			case <-request.Context().Done():
 				return
 			}
-			select {
-			case events <- event:
-			case <-request.Context().Done():
+			if receiveErr != nil {
 				return
 			}
 		}
@@ -206,15 +209,17 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		select {
 		case <-request.Context().Done():
 			return
-		case receiveErr := <-errorsChannel:
-			if !errors.Is(receiveErr, io.EOF) && status.Code(receiveErr) != codes.Canceled {
-				s.logger.WarnContext(request.Context(), "SSE upstream closed", "error", receiveErr, "task_id", request.PathValue("id"))
-			}
-			return
-		case event, open := <-events:
+		case item, open := <-items:
 			if !open {
 				return
 			}
+			if item.err != nil {
+				if !errors.Is(item.err, io.EOF) && status.Code(item.err) != codes.Canceled {
+					s.logger.WarnContext(request.Context(), "SSE upstream closed", "error", item.err, "task_id", request.PathValue("id"))
+				}
+				return
+			}
+			event := item.event
 			eventType := strings.NewReplacer("\r", "", "\n", "").Replace(event.GetType())
 			_, err := fmt.Fprintf(writer, "id: %d\nevent: %s\ndata: %s\n\n", event.GetEventId(), eventType, event.GetPayloadJson())
 			if err != nil {
