@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $headers = @{ Authorization = "Bearer $Token" }
 $health = Invoke-RestMethod -Uri "$BaseUrl/api/v1/health" -TimeoutSec 10
 if (-not $health.ready) { throw "API is not ready" }

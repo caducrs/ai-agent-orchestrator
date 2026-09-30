@@ -19,6 +19,10 @@ A production-oriented portfolio project in Go that decomposes a natural-language
 ```text
 Client
   |
+  | HTML
+  v
+Web Dashboard
+  |
   | REST / SSE
   v
 API Gateway ---- Redis
@@ -43,6 +47,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) and the approved [technical design](.kiro
 
 | Service | Public responsibility | Internal boundary |
 |---|---|---|
+| Web Dashboard | Task workspace, authenticated SSE and result exploration | `web/` |
 | API Gateway | REST, SSE, local auth and Redis GCRA | `services/api-gateway/internal` |
 | Orchestrator | Task lifecycle, DAG, scheduling and aggregation | `services/orchestrator/internal` |
 | LLM Gateway | provider isolation and token budgets | `services/llm-gateway/internal` |
@@ -62,6 +67,8 @@ docker compose up --build -d
 docker compose ps
 Invoke-RestMethod http://localhost:8080/api/v1/health
 ```
+
+Open the operational dashboard at **http://localhost:3001**. It creates Tasks, follows authenticated SSE, displays the four agents, and renders evidence and the final result.
 
 Create a task:
 
@@ -173,6 +180,7 @@ See [docs/API.md](docs/API.md), [OpenAPI](contracts/openapi/v1/orchestrator.yaml
 
 | Component | URL |
 |---|---|
+| Dashboard | http://localhost:3001 |
 | API | http://localhost:8080 |
 | Grafana | http://localhost:3000 (`admin` / `admin`) |
 | Prometheus | http://localhost:9095 |

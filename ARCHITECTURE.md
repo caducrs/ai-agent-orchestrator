@@ -2,7 +2,7 @@
 
 ## Boundaries
 
-The platform uses seven business microservices plus a reproducible demo target. Every service has an independent executable, deployment lifecycle and Go `internal/` boundary. The Orchestrator owns the execution aggregate; the API Gateway is stateless; the LLM Gateway owns provider budgets; each Agent Service owns tool execution records.
+The platform uses seven business microservices, a static operational dashboard, and a reproducible demo target. Every business service has an independent executable, deployment lifecycle and Go `internal/` boundary. The dashboard is served by an unprivileged Nginx container and communicates only through the API Gateway. The Orchestrator owns the execution aggregate; the API Gateway is stateless; the LLM Gateway owns provider budgets; each Agent Service owns tool execution records.
 
 ## Data ownership
 

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AI Agent Orchestrator operational dashboard">
+  <title>AgentOps · Orchestrator</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="AgentOps início">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span><strong>AgentOps</strong><small>ORCHESTRATOR</small></span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Navegação principal">
+        <button class="nav-item active" data-scroll="overview"><span class="nav-icon">⌂</span>Overview</button>
+        <button class="nav-item" data-scroll="execution"><span class="nav-icon">◎</span>Execution</button>
+        <button class="nav-item" data-scroll="agents"><span class="nav-icon">◇</span>Agents</button>
+        <button class="nav-item" data-scroll="result"><span class="nav-icon">≡</span>Result</button>
+      </nav>
+
+      <section class="recent-section" aria-labelledby="recent-title">
+        <div class="section-label" id="recent-title">RECENT TASKS</div>
+        <div id="recent-tasks" class="recent-list">
+          <div class="empty-compact">Nenhuma Task recente</div>
+        </div>
+      </section>
+
+      <section class="ops-links" aria-labelledby="ops-title">
+        <div class="section-label" id="ops-title">OBSERVABILITY</div>
+        <a href="http://localhost:3000" target="_blank" rel="noreferrer"><span class="service-dot grafana"></span>Grafana<span>↗</span></a>
+        <a href="http://localhost:9095" target="_blank" rel="noreferrer"><span class="service-dot prometheus"></span>Prometheus<span>↗</span></a>
+        <a href="http://localhost:8222" target="_blank" rel="noreferrer"><span class="service-dot nats"></span>NATS<span>↗</span></a>
+      </section>
+
+      <div class="sidebar-footer">
+        <div class="connection-state"><span id="connection-dot" class="pulse-dot"></span><span id="connection-label">Connecting</span></div>
+        <button id="open-settings" class="icon-button" aria-label="Configurar autenticação">⚙</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">AUTONOMOUS MULTI-AGENT SYSTEM</div>
+          <h1>Investigation workspace</h1>
+        </div>
+        <div class="top-actions">
+          <div id="health-badge" class="health-badge loading"><span></span><b>Checking platform</b></div>
+          <button id="new-task-button" class="button secondary">New task</button>
+        </div>
+      </header>
+
+      <section id="overview" class="metrics-grid" aria-label="Resumo da execução">
+        <article class="metric-card">
+          <span class="metric-label">PLATFORM</span>
+          <div class="metric-row"><strong id="metric-platform">—</strong><span id="metric-platform-trend" class="metric-trend neutral">checking</span></div>
+          <small>API and persistence readiness</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">AGENTS ONLINE</span>
+          <div class="metric-row"><strong id="metric-agents">0 / 4</strong><span class="metric-trend positive">live</span></div>
+          <small>Registered capabilities</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">CURRENT STATUS</span>
+          <div class="metric-row"><strong id="metric-status">IDLE</strong><span id="metric-elapsed" class="mono">00:00</span></div>
+          <small>Selected orchestration lifecycle</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">EVIDENCE</span>
+          <div class="metric-row"><strong id="metric-evidence">0</strong><span id="metric-events" class="metric-trend neutral">0 events</span></div>
+          <small>Grounded references collected</small>
+        </article>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel create-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="panel-kicker">NEW INVESTIGATION</span>
+              <h2>What should the agents investigate?</h2>
+            </div>
+            <span class="shortcut">⌘ ↵</span>
+          </div>
+          <form id="task-form">
+            <label class="sr-only" for="task-description">Descrição da investigação</label>
+            <textarea id="task-description" maxlength="20000" rows="5" placeholder="Describe a complex incident, anomaly or question...">Analise por que minha aplicação está retornando HTTP 500.</textarea>
+            <div class="suggestion-row" aria-label="Exemplos de investigação">
+              <button type="button" class="suggestion" data-prompt="Analise por que minha aplicação está retornando HTTP 500.">HTTP 500 root cause</button>
+              <button type="button" class="suggestion" data-prompt="Investigue a degradação de latência e identifique gargalos na aplicação.">Latency degradation</button>
+              <button type="button" class="suggestion" data-prompt="Correlacione logs, código, banco e infraestrutura para explicar as falhas recentes.">Cross-system failure</button>
+            </div>
+            <div class="form-footer">
+              <div class="form-hint"><span class="shield">◆</span>Read-only tools · bounded execution</div>
+              <button id="submit-task" class="button primary" type="submit"><span>Launch investigation</span><span>→</span></button>
+            </div>
+          </form>
+        </article>
+
+        <article id="execution" class="panel execution-panel">
+          <div class="panel-heading compact">
+            <div>
+              <span class="panel-kicker">ACTIVE EXECUTION</span>
+              <h2 id="task-title">No task selected</h2>
+            </div>
+            <span id="task-status-badge" class="status-badge idle">IDLE</span>
+          </div>
+          <p id="task-description-display" class="task-description">Launch an investigation to see the orchestration flow.</p>
+          <div class="progress-track"><span id="task-progress"></span></div>
+          <div class="execution-meta">
+            <div><span>TASK ID</span><button id="copy-task-id" class="copy-value mono" disabled>—</button></div>
+            <div><span>STARTED</span><strong id="task-started">—</strong></div>
+            <div><span>DEADLINE</span><strong id="task-deadline">—</strong></div>
+          </div>
+          <div class="execution-actions">
+            <button id="refresh-task" class="button ghost" disabled>Refresh</button>
+            <button id="cancel-task" class="button danger" disabled>Cancel task</button>
+          </div>
+        </article>
+      </section>
+
+      <section id="agents" class="section-block">
+        <div class="section-heading">
+          <div>
+            <span class="panel-kicker">PARALLEL EXECUTION</span>
+            <h2>Specialized agents</h2>
+          </div>
+          <div class="legend"><span><i class="legend-dot waiting"></i>Waiting</span><span><i class="legend-dot running"></i>Running</span><span><i class="legend-dot success"></i>Complete</span></div>
+        </div>
+        <div id="agent-grid" class="agent-grid"></div>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel timeline-panel">
+          <div class="panel-heading compact">
+            <div><span class="panel-kicker">LIVE STREAM</span><h2>Execution timeline</h2></div>
+            <span id="stream-state" class="stream-state offline"><i></i>offline</span>
+          </div>
+          <div id="timeline" class="timeline">
+            <div class="empty-state"><span>◎</span><strong>Waiting for an execution</strong><small>Events will appear here in real time.</small></div>
+          </div>
+        </article>
+
+        <article class="panel system-panel">
+          <div class="panel-heading compact">
+            <div><span class="panel-kicker">SYSTEM</span><h2>Runtime topology</h2></div>
+          </div>
+          <div class="topology">
+            <div class="topology-node featured"><span>API</span><strong>Gateway</strong><i id="topology-api"></i></div>
+            <div class="topology-line"></div>
+            <div class="topology-node"><span>CORE</span><strong>Orchestrator</strong><i id="topology-core"></i></div>
+            <div class="topology-branches"><span></span><span></span><span></span><span></span></div>
+            <div class="topology-agents"><b>CODE</b><b>LOGS</b><b>DB</b><b>INFRA</b></div>
+          </div>
+          <div class="system-links">
+            <a href="http://localhost:3000" target="_blank" rel="noreferrer"><span>Grafana</span><b>Dashboards ↗</b></a>
+            <a href="http://localhost:9095" target="_blank" rel="noreferrer"><span>Prometheus</span><b>Metrics ↗</b></a>
+            <a href="http://localhost:8222/jsz" target="_blank" rel="noreferrer"><span>JetStream</span><b>Consumers ↗</b></a>
+          </div>
+        </article>
+      </section>
+
+      <section id="result" class="panel result-panel hidden">
+        <div class="panel-heading">
+          <div><span class="panel-kicker">FINAL ANSWER</span><h2>Grounded investigation result</h2></div>
+          <button id="copy-result" class="button ghost">Copy summary</button>
+        </div>
+        <div class="result-summary"><span>SUMMARY</span><p id="result-summary"></p></div>
+        <div class="result-columns">
+          <div><h3>Conclusions</h3><div id="result-conclusions" class="result-list"></div></div>
+          <div><h3>Failures & limitations</h3><div id="result-limitations" class="result-list"></div></div>
+        </div>
+        <div><h3>Evidence</h3><div id="result-evidence" class="evidence-grid"></div></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-heading"><div><span class="panel-kicker">SESSION</span><h2>API authentication</h2></div><button class="icon-button" value="cancel" aria-label="Fechar">×</button></div>
+      <label for="token-input">Bearer token</label>
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false">
+      <p>Stored only in this browser tab. The local default is <code>dev-token</code>.</p>
+      <div class="dialog-actions"><button class="button ghost" value="cancel">Cancel</button><button id="save-token" class="button primary" value="default">Save session</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -223,6 +223,22 @@ services:
       - "8080:8080"
     deploy: *app-resources
 
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "3001:8080"
+    deploy: *app-resources
+
   code-agent:
     build:
       context: .
