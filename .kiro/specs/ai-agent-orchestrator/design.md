@@ -49,7 +49,8 @@ O Orchestrator é o único dono do agregado de execução (`Task`, plano, Subtas
 
 ```mermaid
 flowchart TB
-    CLIENT[Cliente] -->|REST / SSE| GW[API Gateway]
+    CLIENT[Cliente] -->|HTML| WEB[Web Dashboard / Nginx]
+    WEB -->|REST / SSE| GW[API Gateway]
     GW -->|gRPC unary + stream| ORCH[Orchestrator Service]
     GW --> REDIS[(Redis)]
 
@@ -98,6 +99,7 @@ flowchart TB
 
 | Serviço | Responsabilidade | Dados exclusivos | Escala |
 |---|---|---|---|
+| `web-dashboard` | Interface estática, proxy same-origin e visualização segura de Tasks | Somente IDs recentes e preferências no navegador | Horizontal, stateless |
 | `api-gateway` | REST, SSE, OIDC, autorização de rota, validação HTTP, rate limit e request IDs | Nenhum estado de negócio | Horizontal, stateless |
 | `orchestrator` | Task lifecycle, Planner, Scheduler, Agent Registry, DAG, retries, cancelamento e Aggregator | Tasks, planos, Subtasks, Attempts, assignments, resultados, eventos, outbox/inbox | Uma ou mais réplicas com claims no DB |
 | `llm-gateway` | Providers, prompts estruturados, function calling, token budgets, retry e redaction | Chamadas LLM, reservas de budget, idempotência e auditoria | Horizontal |
@@ -133,6 +135,13 @@ contracts/
   jsonschema/plan/v1.json
   jsonschema/events/v1/
   jsonschema/tools/v1/
+
+web/
+  index.html
+  styles.css
+  app.js
+  nginx.conf
+  Dockerfile
 
 services/
   api-gateway/
@@ -765,6 +774,14 @@ O Orchestrator:
 5. retorna cursor expirado quando anterior à retenção.
 
 O Gateway envia heartbeat a cada 15 s, limita o buffer por conexão, encerra cliente lento com último cursor seguro e fecha a conexão em até 30 s após expiração da credencial.
+
+### 11.3 Dashboard web
+
+O dashboard é uma aplicação estática sem estado de negócio, servida por Nginx em `localhost:3001`. O mesmo Nginx encaminha `/api/` ao API Gateway com buffering desabilitado para SSE, evitando CORS e mantendo a API como única fronteira de negócio.
+
+A interface contém formulário de criação, histórico recente local, visão de Task, timeline SSE, cards dos quatro agentes, dependências, evidências e Final Result. O Event Stream é consumido com `fetch` streaming para permitir o header `Authorization`; reconexões enviam `Last-Event-ID`. Cada evento dispara atualização da visão persistida da Task.
+
+Conteúdo de usuário, ferramentas e LLM é renderizado exclusivamente com APIs de texto, sem `innerHTML`. O token de desenvolvimento permanece em `sessionStorage`; `localStorage` guarda apenas Task IDs recentes e preferências visuais. A interface é responsiva e mantém estados de loading, vazio, erro, desconectado e terminal.
 
 ## 12. Segurança entre microservices
 

@@ -54,12 +54,20 @@
   - Add OpenAPI, AsyncAPI, run commands, examples, limitations and roadmap.
   - _Requirements: 1, 15, 17, 22-28_
 
-- [ ] 9. Complete final validation
+- [x] 9. Implement the operational web dashboard
+  - Add a responsive static application served by Nginx.
+  - Add Task creation, authenticated SSE, event timeline and cancellation.
+  - Add agent cards, dependencies, evidence and Final Result views.
+  - Add session-scoped credentials and safe text-only rendering of untrusted content.
+  - Integrate the frontend with Docker Compose at port 3001.
+  - _Requirements: 1-2, 4-8, 12, 14-15, 20, 23-24, 29_
+
+- [x] 10. Complete final validation
   - Run formatting, vet, unit tests and race detector for every module.
   - Build every Docker image and validate Compose configuration.
   - _Requirements: 27-28_
 
-- [ ] 10. Execute the end-to-end demonstration
+- [x] 11. Execute the end-to-end demonstration
   - Start the complete Docker stack.
   - Submit an HTTP 500 investigation and observe terminal SSE.
   - Verify results from all four agent capabilities.

@@ -9,6 +9,7 @@ Este documento define somente necessidades e comportamentos verificáveis. Arqui
 ### Escopo da primeira versão
 
 - API REST versionada para criar, consultar e cancelar tarefas, acompanhar eventos, consultar agentes e verificar saúde.
+- Dashboard web responsivo para criar Tasks, acompanhar SSE e explorar agentes, evidências e resultados.
 - Planejamento e agregação assistidos por um **Provider_LLM** compatível com a API da OpenAI.
 - Quatro especializações: logs, banco de dados, código e infraestrutura.
 - Ferramentas reais e somente leitura, com pelo menos um conector executável por especialização.
@@ -19,7 +20,6 @@ Este documento define somente necessidades e comportamentos verificáveis. Arqui
 
 ### Fora do escopo da primeira versão
 
-- Interface gráfica.
 - Ferramentas de escrita, remediação automática, execução arbitrária de shell ou alteração de infraestrutura.
 - Treinamento ou fine-tuning de modelos.
 - Marketplace, criação dinâmica de tipos de agentes ou cobrança multi-tenant.
@@ -781,6 +781,25 @@ Este documento define somente necessidades e comportamentos verificáveis. Arqui
 13. WHEN uma nova especialização ou Tool for adicionada, THE AI_Agent_Orchestrator SHALL permitir registro no Agent_Registry e no Tool_Gateway sem alterar contratos públicos existentes da Task.
 14. WHEN limites de concorrência ou integrações externas mudarem, THE AI_Agent_Orchestrator SHALL aceitar a evolução por configuração ou extensão localizada sem alterar a semântica de Task_Status.
 15. WHEN o código for submetido ao pipeline, THE AI_Agent_Orchestrator SHALL atender a `gofmt`, `go vet` e ao Race_Detector.
+
+### Requirement 29: Dashboard web operacional
+
+**User Story:** Como operador, quero criar e acompanhar Tasks por uma interface web, para demonstrar o sistema e investigar resultados sem manipular requisições HTTP manualmente.
+
+#### Acceptance Criteria
+
+1. WHEN um operador abrir o dashboard, THE Web_Dashboard SHALL exibir o estado de saúde da API, os Specialized_Agents registrados e os links operacionais configurados.
+2. WHEN um operador submeter uma Task_Description válida pelo formulário, THE Web_Dashboard SHALL criar a Task pela API v1 e selecionar o Task_ID retornado para acompanhamento.
+3. IF a criação da Task falhar, THEN THE Web_Dashboard SHALL exibir o Error_Envelope de forma segura sem perder o texto ainda não submetido.
+4. WHEN uma Task for selecionada, THE Web_Dashboard SHALL exibir Task_Status, horários, Subtasks, Dependencies, Attempts, erros e resultados disponíveis.
+5. WHILE a Task selecionada não estiver em Terminal_Task_Status, THE Web_Dashboard SHALL consumir o Event_Stream autenticado e atualizar a timeline em ordem crescente de Event_ID.
+6. IF o Event_Stream desconectar antes do estado terminal, THEN THE Web_Dashboard SHALL retomar a conexão usando o último Event_ID processado sem duplicar eventos já apresentados.
+7. WHEN resultados de agentes estiverem disponíveis, THE Web_Dashboard SHALL apresentar cards separados para código, logs, banco de dados e infraestrutura com estado, resumo, evidências, avisos e erros.
+8. WHEN o Final_Result estiver disponível, THE Web_Dashboard SHALL apresentar resumo, conclusões, evidências, falhas parciais e limitações em seções distintas.
+9. WHEN conteúdo originado de Task_Description, Tool_Output ou Final_Result for renderizado, THE Web_Dashboard SHALL tratá-lo como texto e impedir sua interpretação como HTML executável.
+10. WHEN o operador solicitar cancelamento de uma Task não terminal, THE Web_Dashboard SHALL chamar a API v1 e refletir o estado confirmado pelo servidor.
+11. THE Web_Dashboard SHALL preservar no navegador somente identificadores das Tasks recentes e preferências não sensíveis; credenciais SHALL permanecer limitadas à sessão ativa.
+12. THE Web_Dashboard SHALL manter navegação e informações essenciais utilizáveis em larguras de 360 a 1.920 pixels e fornecer nomes acessíveis para controles interativos.
 
 ## Decisões obrigatórias para a fase de design
 
