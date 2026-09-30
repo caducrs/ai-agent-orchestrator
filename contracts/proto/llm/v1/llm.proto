@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package llm.v1;
+
+option go_package = "github.com/caduc/ai-agent-orchestrator/contracts/gen/go/llm/v1;llmv1";
+
+service LLMGatewayService {
+  rpc OpenTaskBudget(OpenTaskBudgetRequest) returns (OpenTaskBudgetResponse);
+  rpc Plan(PlanRequest) returns (PlanResponse);
+  rpc AgentStep(AgentStepRequest) returns (AgentStepResponse);
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message OpenTaskBudgetRequest {
+  string task_id = 1;
+  int64 max_tokens = 2;
+}
+
+message OpenTaskBudgetResponse {
+  string task_id = 1;
+  int64 max_tokens = 2;
+  int64 used_tokens = 3;
+}
+
+message PlanRequest {
+  string task_id = 1;
+  string description = 2;
+  repeated string available_capabilities = 3;
+  int32 max_subtasks = 4;
+}
+
+message PlanResponse {
+  repeated PlannedSubtask subtasks = 1;
+  string model = 2;
+  int64 input_tokens = 3;
+  int64 output_tokens = 4;
+}
+
+message PlannedSubtask {
+  string id = 1;
+  string description = 2;
+  string capability = 3;
+  repeated string depends_on = 4;
+  int32 timeout_seconds = 5;
+  int32 max_attempts = 6;
+}
+
+message AgentStepRequest {
+  string task_id = 1;
+  string subtask_id = 2;
+  string capability = 3;
+  string objective = 4;
+  repeated ToolDefinition tools = 5;
+  repeated ToolObservation observations = 6;
+}
+
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  string input_schema_json = 3;
+}
+
+message ToolObservation {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string output_json = 3;
+}
+
+message AgentStepResponse {
+  string summary = 1;
+  ToolProposal tool_call = 2;
+  bool complete = 3;
+  int64 input_tokens = 4;
+  int64 output_tokens = 5;
+}
+
+message ToolProposal {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string arguments_json = 3;
+}
+
+message AggregateRequest {
+  string task_id = 1;
+  string task_description = 2;
+  repeated NormalizedResult results = 3;
+}
+
+message NormalizedResult {
+  string subtask_id = 1;
+  string capability = 2;
+  bool success = 3;
+  string summary = 4;
+  repeated Evidence evidence = 5;
+  repeated string warnings = 6;
+  string error_code = 7;
+}
+
+message Evidence {
+  string source = 1;
+  string reference = 2;
+  string content = 3;
+}
+
+message AggregateResponse {
+  string summary = 1;
+  repeated string conclusions = 2;
+  repeated Evidence evidence = 3;
+  repeated string failures = 4;
+  repeated string limitations = 5;
+  int64 input_tokens = 6;
+  int64 output_tokens = 7;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool live = 1;
+  bool ready = 2;
+  string provider = 3;
+}

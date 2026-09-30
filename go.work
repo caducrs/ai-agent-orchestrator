@@ -1,0 +1,14 @@
+go 1.27.0
+
+use (
+	./contracts
+	./services/agents
+	./services/agents/code-agent
+	./services/agents/database-agent
+	./services/agents/infrastructure-agent
+	./services/agents/log-agent
+	./services/api-gateway
+	./services/demo-app
+	./services/llm-gateway
+	./services/orchestrator
+)

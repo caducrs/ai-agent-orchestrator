@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package orchestrator.v1;
+
+option go_package = "github.com/caduc/ai-agent-orchestrator/contracts/gen/go/orchestrator/v1;orchestratorv1";
+
+import "google/protobuf/timestamp.proto";
+
+service OrchestratorService {
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc WatchTaskEvents(WatchTaskEventsRequest) returns (stream WatchTaskEventsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_PLANNING = 2;
+  TASK_STATUS_RUNNING = 3;
+  TASK_STATUS_AGGREGATING = 4;
+  TASK_STATUS_COMPLETED = 5;
+  TASK_STATUS_PARTIALLY_COMPLETED = 6;
+  TASK_STATUS_FAILED = 7;
+  TASK_STATUS_CANCELLED = 8;
+}
+
+enum SubtaskStatus {
+  SUBTASK_STATUS_UNSPECIFIED = 0;
+  SUBTASK_STATUS_PENDING = 1;
+  SUBTASK_STATUS_BLOCKED = 2;
+  SUBTASK_STATUS_READY = 3;
+  SUBTASK_STATUS_RUNNING = 4;
+  SUBTASK_STATUS_SUCCEEDED = 5;
+  SUBTASK_STATUS_FAILED = 6;
+  SUBTASK_STATUS_SKIPPED = 7;
+  SUBTASK_STATUS_CANCELLED = 8;
+}
+
+message Principal {
+  string subject = 1;
+  repeated string scopes = 2;
+  repeated string roles = 3;
+}
+
+message CreateTaskRequest {
+  string description = 1;
+  string idempotency_key = 2;
+  Principal principal = 3;
+  string request_id = 4;
+}
+
+message CreateTaskResponse {
+  Task task = 1;
+  bool replayed = 2;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+  Principal principal = 2;
+}
+
+message GetTaskResponse {
+  Task task = 1;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+  Principal principal = 2;
+  string request_id = 3;
+}
+
+message CancelTaskResponse {
+  Task task = 1;
+}
+
+message ListAgentsRequest {
+  Principal principal = 1;
+}
+
+message ListAgentsResponse {
+  repeated Agent agents = 1;
+}
+
+message WatchTaskEventsRequest {
+  string task_id = 1;
+  int64 after_event_id = 2;
+  Principal principal = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool live = 1;
+  bool ready = 2;
+  string version = 3;
+  repeated ComponentHealth components = 4;
+}
+
+message ComponentHealth {
+  string component = 1;
+  string status = 2;
+}
+
+message Task {
+  string id = 1;
+  string owner_subject = 2;
+  string description = 3;
+  TaskStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  google.protobuf.Timestamp deadline_at = 7;
+  repeated Subtask subtasks = 8;
+  FinalResult final_result = 9;
+  string error_code = 10;
+}
+
+message Subtask {
+  string id = 1;
+  string description = 2;
+  string capability = 3;
+  SubtaskStatus status = 4;
+  repeated string depends_on = 5;
+  int32 attempt = 6;
+  AgentResult result = 7;
+  string error_code = 8;
+}
+
+message AgentResult {
+  string summary = 1;
+  repeated Evidence evidence = 2;
+  repeated string warnings = 3;
+  bool truncated = 4;
+}
+
+message Evidence {
+  string source = 1;
+  string reference = 2;
+  string content = 3;
+}
+
+message FinalResult {
+  string summary = 1;
+  repeated string conclusions = 2;
+  repeated Evidence evidence = 3;
+  repeated string failures = 4;
+  repeated string limitations = 5;
+}
+
+message Agent {
+  string id = 1;
+  string type = 2;
+  string version = 3;
+  repeated string capabilities = 4;
+  string status = 5;
+}
+
+message WatchTaskEventsResponse {
+  string task_id = 1;
+  int64 event_id = 2;
+  string type = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+  string payload_json = 5;
+}

@@ -1,0 +1,25 @@
+asyncapi: 3.0.0
+info:
+  title: AI Agent Orchestrator Events
+  version: 1.0.0
+channels:
+  agentCommands:
+    address: commands.agent.{agentType}.execute.v1
+    messages:
+      command:
+        $ref: '#/components/messages/AgentCommand'
+  agentResults:
+    address: results.agent.{agentType}.completed.v1
+    messages:
+      result:
+        $ref: '#/components/messages/AgentResult'
+components:
+  messages:
+    AgentCommand:
+      payload:
+        type: object
+        required: [schema_version, message_id, task_id, subtask_id, attempt_id, capability, objective, deadline]
+    AgentResult:
+      payload:
+        type: object
+        required: [schema_version, message_id, task_id, subtask_id, attempt_id, agent_type, success, summary, completed_at]

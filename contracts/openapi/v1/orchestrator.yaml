@@ -1,0 +1,283 @@
+openapi: 3.1.0
+info:
+  title: AI Agent Orchestrator API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /tasks:
+    post:
+      operationId: createTask
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+            maxLength: 255
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '202':
+          description: Task accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTaskResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/Error'
+        '415':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /tasks/{taskId}:
+    get:
+      operationId: getTask
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: '#/components/schemas/Task'
+        '404':
+          $ref: '#/components/responses/Error'
+  /tasks/{taskId}/cancel:
+    post:
+      operationId: cancelTask
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Cancellation state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: '#/components/schemas/Task'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+  /tasks/{taskId}/events:
+    get:
+      operationId: watchTaskEvents
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - in: header
+          name: Last-Event-ID
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Server-Sent Events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/Error'
+  /agents:
+    get:
+      operationId: listAgents
+      responses:
+        '200':
+          description: Registered agent capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Agent'
+  /health:
+    get:
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Not ready
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    TaskId:
+      in: path
+      name: taskId
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Error:
+      description: Error envelope
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [description]
+      properties:
+        description:
+          type: string
+          minLength: 1
+          maxLength: 20000
+    CreateTaskResponse:
+      type: object
+      required: [task, replayed]
+      properties:
+        task:
+          $ref: '#/components/schemas/Task'
+        replayed:
+          type: boolean
+    Task:
+      type: object
+      required: [id, owner_subject, description, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        owner_subject:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [TASK_STATUS_QUEUED, TASK_STATUS_PLANNING, TASK_STATUS_RUNNING, TASK_STATUS_AGGREGATING, TASK_STATUS_COMPLETED, TASK_STATUS_PARTIALLY_COMPLETED, TASK_STATUS_FAILED, TASK_STATUS_CANCELLED]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deadline_at:
+          type: string
+          format: date-time
+        subtasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Subtask'
+        final_result:
+          $ref: '#/components/schemas/FinalResult'
+        error_code:
+          type: string
+    Subtask:
+      type: object
+      properties:
+        id:
+          type: string
+        description:
+          type: string
+        capability:
+          type: string
+          enum: [code, logs, database, infrastructure]
+        status:
+          type: string
+        depends_on:
+          type: array
+          items:
+            type: string
+        attempt:
+          type: integer
+        result:
+          $ref: '#/components/schemas/AgentResult'
+        error_code:
+          type: string
+    AgentResult:
+      type: object
+      properties:
+        summary:
+          type: string
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        warnings:
+          type: array
+          items:
+            type: string
+        truncated:
+          type: boolean
+    FinalResult:
+      type: object
+      properties:
+        summary:
+          type: string
+        conclusions:
+          type: array
+          items:
+            type: string
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        failures:
+          type: array
+          items:
+            type: string
+        limitations:
+          type: array
+          items:
+            type: string
+    Evidence:
+      type: object
+      properties:
+        source:
+          type: string
+        reference:
+          type: string
+        content:
+          type: string
+    Agent:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        version:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
