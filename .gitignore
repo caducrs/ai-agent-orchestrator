@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+bin/
+dist/
+coverage/
+*.coverprofile
+*.test
+*.exe
+*.log
+.DS_Store
+.idea/
+.vscode/
+.kiro/settings/mcp.json

@@ -1,0 +1,8 @@
+.git
+.kiro
+**/.idea
+**/.vscode
+**/bin
+**/tmp
+**/*.log
+.env

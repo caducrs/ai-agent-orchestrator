@@ -1,0 +1,324 @@
+name: ai-agent-orchestrator
+
+x-app-resources: &app-resources
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 256M
+
+x-agent-health: &agent-health
+  test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 20
+  start_period: 5s
+
+services:
+  postgres:
+    image: postgres:17.4-alpine
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "6379:6379"
+
+  nats:
+    image: nats:2.11.1-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./infra/loki/loki.yaml:/etc/loki/local-config.yaml:ro
+    tmpfs:
+      - /loki:uid=10001,gid=10001,mode=0770
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "3100:3100"
+
+  demo-app:
+    build:
+      context: .
+      dockerfile: services/demo-app/Dockerfile
+    environment:
+      HTTP_ADDR: :8080
+      LOKI_PUSH_URL: http://loki:3100/loki/api/v1/push
+    depends_on:
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy: *app-resources
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      demo-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "9095:9090"
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./infra/tempo/tempo.yaml:/etc/tempo.yaml:ro
+    tmpfs:
+      - /var/tempo:uid=10001,gid=10001,mode=0770
+    ports:
+      - "3200:3200"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.121.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./infra/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - tempo
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "9464:9464"
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    ports:
+      - "3000:3000"
+
+  llm-gateway:
+    build:
+      context: .
+      dockerfile: services/llm-gateway/Dockerfile
+    environment:
+      GRPC_ADDR: :9091
+      DATABASE_URL: postgres://llm:llm@postgres:5432/llm_gateway?sslmode=disable
+      LLM_PROVIDER: ${LLM_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      SERVICE_VERSION: 1.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9091"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy: *app-resources
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    environment:
+      GRPC_ADDR: :9090
+      DATABASE_URL: postgres://orchestrator:orchestrator@postgres:5432/orchestrator?sslmode=disable
+      NATS_URL: nats://nats:4222
+      LLM_GRPC_ADDR: llm-gateway:9091
+      SERVICE_VERSION: 1.0.0
+      TASK_TIMEOUT: 10m
+      SUBTASK_TIMEOUT: 2m
+      RESULT_CONCURRENCY: 8
+      LOCAL_DEVELOPMENT_MODE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      llm-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9090"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy: *app-resources
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    environment:
+      HTTP_ADDR: :8080
+      ORCHESTRATOR_GRPC_ADDR: orchestrator:9090
+      REDIS_ADDR: redis:6379
+      LOCAL_DEVELOPMENT_MODE: "true"
+      DEVELOPMENT_TOKEN: ${DEVELOPMENT_TOKEN:-dev-token}
+      DEVELOPMENT_SUBJECT: ${DEVELOPMENT_SUBJECT:-portfolio-user}
+      SERVICE_VERSION: 1.0.0
+      RATE_PER_SECOND: 20
+      RATE_BURST: 40
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "8080:8080"
+    deploy: *app-resources
+
+  code-agent:
+    build:
+      context: .
+      dockerfile: services/agents/Dockerfile
+      args:
+        AGENT: code-agent
+    environment:
+      AGENT_TYPE: code
+      DATABASE_URL: postgres://code_agent:code_agent@postgres:5432/code_agent?sslmode=disable
+      NATS_URL: nats://nats:4222
+      HEALTH_ADDR: :8081
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      CODE_ROOT: /workspace
+    volumes:
+      - ./:/workspace:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck: *agent-health
+    deploy: *app-resources
+
+  log-agent:
+    build:
+      context: .
+      dockerfile: services/agents/Dockerfile
+      args:
+        AGENT: log-agent
+    environment:
+      AGENT_TYPE: logs
+      DATABASE_URL: postgres://log_agent:log_agent@postgres:5432/log_agent?sslmode=disable
+      NATS_URL: nats://nats:4222
+      HEALTH_ADDR: :8081
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      LOKI_URL: http://loki:3100
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      demo-app:
+        condition: service_healthy
+    healthcheck: *agent-health
+    deploy: *app-resources
+
+  database-agent:
+    build:
+      context: .
+      dockerfile: services/agents/Dockerfile
+      args:
+        AGENT: database-agent
+    environment:
+      AGENT_TYPE: database
+      DATABASE_URL: postgres://database_agent:database_agent@postgres:5432/database_agent?sslmode=disable
+      TARGET_DATABASE_URL: postgres://diagnostic_reader:diagnostic_reader@postgres:5432/target_demo?sslmode=disable
+      NATS_URL: nats://nats:4222
+      HEALTH_ADDR: :8081
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck: *agent-health
+    deploy: *app-resources
+
+  infrastructure-agent:
+    build:
+      context: .
+      dockerfile: services/agents/Dockerfile
+      args:
+        AGENT: infrastructure-agent
+    environment:
+      AGENT_TYPE: infrastructure
+      DATABASE_URL: postgres://infrastructure_agent:infrastructure_agent@postgres:5432/infrastructure_agent?sslmode=disable
+      NATS_URL: nats://nats:4222
+      HEALTH_ADDR: :8081
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      INFRA_HEALTH_URL: http://demo-app:8080/health
+      PROMETHEUS_URL: http://prometheus:9090
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    healthcheck: *agent-health
+    deploy: *app-resources
+
+volumes:
+  postgres-data:
+  redis-data:
+  nats-data:
+  prometheus-data:
+  grafana-data:
