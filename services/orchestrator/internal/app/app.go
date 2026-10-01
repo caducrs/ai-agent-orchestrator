@@ -12,10 +12,12 @@ import (
 	llmv1 "github.com/caduc/ai-agent-orchestrator/contracts/gen/go/llm/v1"
 	orchestratorv1 "github.com/caduc/ai-agent-orchestrator/contracts/gen/go/orchestrator/v1"
 	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/config"
+	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/observability"
 	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/service"
 	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
@@ -27,6 +29,15 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("load configuration: %w", err)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "orchestrator", "version", cfg.ServiceVersion)
+	telemetryShutdown, err := observability.Setup(ctx, "orchestrator", cfg.ServiceVersion, os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = telemetryShutdown(shutdownCtx)
+	}()
 	startupCtx, cancelStartup := context.WithTimeout(ctx, cfg.StartupTimeout)
 	defer cancelStartup()
 
@@ -50,7 +61,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("open JetStream context: %w", err)
 	}
 
-	llmConnection, err := grpc.NewClient(cfg.LLMGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	llmConnection, err := grpc.NewClient(cfg.LLMGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if err != nil {
 		return fmt.Errorf("connect LLM Gateway: %w", err)
 	}
@@ -69,6 +80,7 @@ func Run(ctx context.Context) error {
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(1<<20),
 		grpc.MaxSendMsgSize(4<<20),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 	orchestratorv1.RegisterOrchestratorServiceServer(grpcServer, service.NewServer(storage, logger, cfg.ServiceVersion, cfg.TaskTimeout))
 	reflection.Register(grpcServer)

@@ -15,6 +15,11 @@ import (
 	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/domain"
 	"github.com/caduc/ai-agent-orchestrator/services/orchestrator/internal/store"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Runtime struct {
@@ -107,6 +112,8 @@ func (r *Runtime) processOnePlanningTask(ctx context.Context) {
 	if task == nil {
 		return
 	}
+	ctx, span := otel.Tracer("orchestrator.runtime").Start(ctx, "task.plan", trace.WithAttributes(attribute.String("task.id", task.ID)))
+	defer span.End()
 	planningCtx, cancel := context.WithDeadline(ctx, minTime(task.DeadlineAt, time.Now().Add(45*time.Second)))
 	defer cancel()
 	_, _ = r.llm.OpenTaskBudget(planningCtx, &llmv1.OpenTaskBudgetRequest{TaskId: task.ID, MaxTokens: 100_000})
@@ -150,6 +157,7 @@ func (r *Runtime) processOnePlanningTask(ctx context.Context) {
 		_ = r.store.FailPlanning(ctx, task.ID, "PLAN_PERSISTENCE_FAILED")
 		return
 	}
+	span.SetStatus(codes.Ok, "plan persisted")
 	r.logger.InfoContext(ctx, "task plan dispatched", "task_id", task.ID, "subtasks", len(plan))
 }
 
@@ -236,12 +244,26 @@ func (r *Runtime) handleResult(ctx context.Context, message *nats.Msg) {
 		_ = message.Term()
 		return
 	}
+	carrier := propagation.MapCarrier{}
+	if result.Traceparent != "" {
+		carrier.Set("traceparent", result.Traceparent)
+	}
+	parentCtx := otel.GetTextMapPropagator().Extract(ctx, carrier)
+	ctx, span := otel.Tracer("orchestrator.runtime").Start(parentCtx, "agent.result.consume", trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(
+		attribute.String("task.id", result.TaskID),
+		attribute.String("subtask.id", result.SubtaskID),
+		attribute.String("attempt.id", result.AttemptID),
+		attribute.String("agent.type", result.AgentType),
+	))
+	defer span.End()
 	messageID := result.MessageID
 	if messageID == "" {
 		messageID = message.Header.Get("Nats-Msg-Id")
 	}
 	aggregate, err := r.store.ApplyAgentResult(ctx, messageID, message.Data, result)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		r.logger.ErrorContext(ctx, "apply agent result failed", "task_id", result.TaskID, "subtask_id", result.SubtaskID, "error", err)
 		_ = message.NakWithDelay(time.Second)
 		return
@@ -249,12 +271,15 @@ func (r *Runtime) handleResult(ctx context.Context, message *nats.Msg) {
 	if err := message.Ack(); err != nil {
 		r.logger.WarnContext(ctx, "ack agent result failed", "message_id", messageID, "error", err)
 	}
+	span.SetStatus(codes.Ok, "result applied")
 	if aggregate {
 		r.aggregateTask(ctx, result.TaskID)
 	}
 }
 
 func (r *Runtime) aggregateTask(ctx context.Context, taskID string) {
+	ctx, span := otel.Tracer("orchestrator.runtime").Start(ctx, "task.aggregate", trace.WithAttributes(attribute.String("task.id", taskID)))
+	defer span.End()
 	task, err := r.store.GetTask(ctx, taskID)
 	if err != nil {
 		r.logger.ErrorContext(ctx, "load task for aggregation failed", "task_id", taskID, "error", err)
@@ -288,6 +313,7 @@ func (r *Runtime) aggregateTask(ctx context.Context, taskID string) {
 		r.logger.ErrorContext(ctx, "complete task failed", "task_id", taskID, "error", err)
 		return
 	}
+	span.SetStatus(codes.Ok, "task completed")
 	r.logger.InfoContext(ctx, "task completed", "task_id", taskID, "llm_fallback", callErr != nil)
 }
 

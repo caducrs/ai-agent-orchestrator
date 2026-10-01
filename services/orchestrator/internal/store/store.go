@@ -14,6 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var (
@@ -335,11 +337,12 @@ func (s *Store) ApplyAgentResult(ctx context.Context, messageID string, payload 
 		return false, nil
 	}
 
-	var taskStatus, subtaskStatus, currentAttempt string
+	var taskStatus, subtaskStatus, currentAttempt, capability, description string
+	var attemptNumber, maxAttempts, timeoutSeconds int32
 	err = tx.QueryRow(ctx, `
-		SELECT t.status,s.status,COALESCE(s.current_attempt_id,'')
+		SELECT t.status,s.status,COALESCE(s.current_attempt_id,''),s.attempt,s.max_attempts,s.capability,s.description,s.timeout_seconds
 		FROM subtasks s JOIN tasks t ON t.id=s.task_id
-		WHERE s.id=$1 AND s.task_id=$2 FOR UPDATE OF s,t`, incoming.SubtaskID, incoming.TaskID).Scan(&taskStatus, &subtaskStatus, &currentAttempt)
+		WHERE s.id=$1 AND s.task_id=$2 FOR UPDATE OF s,t`, incoming.SubtaskID, incoming.TaskID).Scan(&taskStatus, &subtaskStatus, &currentAttempt, &attemptNumber, &maxAttempts, &capability, &description, &timeoutSeconds)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
 	}
@@ -371,6 +374,24 @@ func (s *Store) ApplyAgentResult(ctx context.Context, messageID string, payload 
 	}
 	if _, err = tx.Exec(ctx, `UPDATE attempts SET status=$2,error_code=$3,finished_at=now() WHERE id=$1`, incoming.AttemptID, attemptStatus, incoming.ErrorCode); err != nil {
 		return false, fmt.Errorf("finish attempt: %w", err)
+	}
+	if !incoming.Success && isTransientFailure(incoming.ErrorCode) && attemptNumber < maxAttempts {
+		if _, err = tx.Exec(ctx, `UPDATE subtasks SET status='READY',result=NULL,error_code=$2,updated_at=now() WHERE id=$1`, incoming.SubtaskID, incoming.ErrorCode); err != nil {
+			return false, fmt.Errorf("schedule subtask retry: %w", err)
+		}
+		if _, err = s.appendEventTx(ctx, tx, incoming.TaskID, "subtask.retry_scheduled", map[string]any{"subtask_id": incoming.SubtaskID, "attempt": attemptNumber + 1, "error_code": incoming.ErrorCode}); err != nil {
+			return false, err
+		}
+		if err := s.dispatchTx(ctx, tx, incoming.TaskID, incoming.SubtaskID, capability, description, timeoutSeconds); err != nil {
+			return false, err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer='orchestrator-results' AND message_id=$1`, messageID); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit subtask retry: %w", err)
+		}
+		return false, nil
 	}
 	if _, err = tx.Exec(ctx, `UPDATE subtasks SET status=$2,result=$3,error_code=$4,updated_at=now() WHERE id=$1`, incoming.SubtaskID, newStatus, resultRaw, incoming.ErrorCode); err != nil {
 		return false, fmt.Errorf("finish subtask: %w", err)
@@ -504,7 +525,9 @@ func (s *Store) dispatchTx(ctx context.Context, tx pgx.Tx, taskID, subtaskID, ca
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_assignments(id,attempt_id,agent_type) VALUES($1,$2,$3)`, assignmentID, attemptID, capability); err != nil {
 		return fmt.Errorf("insert assignment: %w", err)
 	}
-	command := asyncv1.AgentCommand{SchemaVersion: asyncv1.SchemaVersion, MessageID: outboxID, TaskID: taskID, SubtaskID: subtaskID, AttemptID: attemptID, Capability: capability, Objective: objective, Deadline: attemptDeadline}
+	traceCarrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, traceCarrier)
+	command := asyncv1.AgentCommand{SchemaVersion: asyncv1.SchemaVersion, MessageID: outboxID, TaskID: taskID, SubtaskID: subtaskID, AttemptID: attemptID, Capability: capability, Objective: objective, Deadline: attemptDeadline, Traceparent: traceCarrier.Get("traceparent")}
 	payload, err := marshal(command)
 	if err != nil {
 		return fmt.Errorf("encode agent command: %w", err)
@@ -513,7 +536,7 @@ func (s *Store) dispatchTx(ctx context.Context, tx pgx.Tx, taskID, subtaskID, ca
 	if subject == "" {
 		return fmt.Errorf("unknown capability %q", capability)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO outbox_messages(id,subject,payload) VALUES($1,$2,$3)`, outboxID, subject, payload); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO outbox_messages(id,subject,payload,available_at) VALUES($1,$2,$3,CASE WHEN $4::integer>1 THEN now()+(power(2.0,$4::integer-2)::double precision+random())*interval '1 second' ELSE now() END)`, outboxID, subject, payload, attemptNumber); err != nil {
 		return fmt.Errorf("insert outbox command: %w", err)
 	}
 	_, err = s.appendEventTx(ctx, tx, taskID, "subtask.dispatched", map[string]any{"subtask_id": subtaskID, "attempt_id": attemptID, "capability": capability})
@@ -600,4 +623,13 @@ func (s *Store) scheduleAndCloseTx(ctx context.Context, tx pgx.Tx, taskID string
 		}
 	}
 	return false, nil
+}
+
+func isTransientFailure(code string) bool {
+	switch code {
+	case "TIMEOUT", "TOOL_EXECUTION_FAILED", "SOURCE_UNAVAILABLE", "LLM_UNAVAILABLE":
+		return true
+	default:
+		return false
+	}
 }
