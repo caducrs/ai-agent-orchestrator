@@ -13,10 +13,16 @@ import (
 	"time"
 
 	asyncv1 "github.com/caduc/ai-agent-orchestrator/contracts/async/v1"
+	"github.com/caduc/ai-agent-orchestrator/services/agents/internal/observability"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ExecuteFunc func(context.Context, string) (string, []asyncv1.Evidence, []string, error)
@@ -75,6 +81,15 @@ func Run(ctx context.Context, execute ExecuteFunc) error {
 		return fmt.Errorf("WORKER_CONCURRENCY must be between 1 and 256")
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", typeName+"-agent", "instance_id", hostname()+"-"+uuid.NewString())
+	telemetryShutdown, err := observability.Setup(ctx, typeName+"-agent", "1.0.0", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = telemetryShutdown(shutdownCtx)
+	}()
 	startupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	pool, err := connectPostgres(startupCtx, env("DATABASE_URL", "postgres://agent:agent@localhost:5432/agent?sslmode=disable"))
@@ -183,6 +198,18 @@ func (r *runtime) process(ctx context.Context, message *nats.Msg) {
 		_ = message.Term()
 		return
 	}
+	carrier := propagation.MapCarrier{}
+	if command.Traceparent != "" {
+		carrier.Set("traceparent", command.Traceparent)
+	}
+	parentCtx := otel.GetTextMapPropagator().Extract(ctx, carrier)
+	ctx, span := otel.Tracer("agent.runtime").Start(parentCtx, "agent.execute", trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(
+		attribute.String("task.id", command.TaskID),
+		attribute.String("subtask.id", command.SubtaskID),
+		attribute.String("attempt.id", command.AttemptID),
+		attribute.String("agent.type", r.typeName),
+	))
+	defer span.End()
 	claimed, completed, err := r.claim(ctx, command.MessageID)
 	if err != nil {
 		_ = message.NakWithDelay(time.Second)
@@ -204,8 +231,12 @@ func (r *runtime) process(ctx context.Context, message *nats.Msg) {
 	started := time.Now()
 	summary, evidence, warnings, toolErr := r.execute(toolCtx, command.Objective)
 	cancel()
-	result := asyncv1.AgentResult{SchemaVersion: asyncv1.SchemaVersion, MessageID: uuid.NewString(), TaskID: command.TaskID, SubtaskID: command.SubtaskID, AttemptID: command.AttemptID, AgentType: r.typeName, Success: toolErr == nil, Summary: summary, Evidence: evidence, Warnings: warnings, CompletedAt: time.Now().UTC()}
+	resultCarrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, resultCarrier)
+	result := asyncv1.AgentResult{SchemaVersion: asyncv1.SchemaVersion, MessageID: uuid.NewString(), TaskID: command.TaskID, SubtaskID: command.SubtaskID, AttemptID: command.AttemptID, AgentType: r.typeName, Success: toolErr == nil, Summary: summary, Evidence: evidence, Warnings: warnings, Traceparent: resultCarrier.Get("traceparent"), CompletedAt: time.Now().UTC()}
 	if toolErr != nil {
+		span.RecordError(toolErr)
+		span.SetStatus(codes.Error, toolErr.Error())
 		result.ErrorCode = "TOOL_EXECUTION_FAILED"
 		if errors.Is(toolErr, context.DeadlineExceeded) || errors.Is(toolCtx.Err(), context.DeadlineExceeded) {
 			result.ErrorCode = "TIMEOUT"
@@ -220,6 +251,9 @@ func (r *runtime) process(ctx context.Context, message *nats.Msg) {
 		return
 	}
 	_ = message.Ack()
+	if toolErr == nil {
+		span.SetStatus(codes.Ok, "completed")
+	}
 	r.logger.InfoContext(ctx, "agent command completed", "task_id", command.TaskID, "subtask_id", command.SubtaskID, "success", result.Success)
 }
 

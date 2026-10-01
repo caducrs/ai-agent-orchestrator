@@ -157,6 +157,7 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       SERVICE_VERSION: 1.0.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,6 +178,7 @@ services:
       NATS_URL: nats://nats:4222
       LLM_GRPC_ADDR: llm-gateway:9091
       SERVICE_VERSION: 1.0.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       TASK_TIMEOUT: 10m
       SUBTASK_TIMEOUT: 2m
       RESULT_CONCURRENCY: 8
@@ -207,6 +209,7 @@ services:
       DEVELOPMENT_TOKEN: ${DEVELOPMENT_TOKEN:-dev-token}
       DEVELOPMENT_SUBJECT: ${DEVELOPMENT_SUBJECT:-portfolio-user}
       SERVICE_VERSION: 1.0.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       RATE_PER_SECOND: 20
       RATE_BURST: 40
     depends_on:
@@ -251,6 +254,7 @@ services:
       NATS_URL: nats://nats:4222
       HEALTH_ADDR: :8081
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       CODE_ROOT: /workspace
     volumes:
       - ./:/workspace:ro
@@ -274,6 +278,7 @@ services:
       NATS_URL: nats://nats:4222
       HEALTH_ADDR: :8081
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       LOKI_URL: http://loki:3100
     depends_on:
       postgres:
@@ -300,6 +305,7 @@ services:
       NATS_URL: nats://nats:4222
       HEALTH_ADDR: :8081
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
     depends_on:
       postgres:
         condition: service_healthy
@@ -320,6 +326,7 @@ services:
       NATS_URL: nats://nats:4222
       HEALTH_ADDR: :8081
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       INFRA_HEALTH_URL: http://demo-app:8080/health
       PROMETHEUS_URL: http://prometheus:9090
     depends_on:

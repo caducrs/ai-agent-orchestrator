@@ -37,6 +37,7 @@ type AgentResult struct {
 	Evidence      []Evidence `json:"evidence,omitempty"`
 	Warnings      []string   `json:"warnings,omitempty"`
 	ErrorCode     string     `json:"error_code,omitempty"`
+	Traceparent   string     `json:"traceparent,omitempty"`
 	CompletedAt   time.Time  `json:"completed_at"`
 }
 

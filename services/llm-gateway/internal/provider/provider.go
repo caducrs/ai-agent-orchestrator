@@ -13,6 +13,7 @@ import (
 
 	llmv1 "github.com/caduc/ai-agent-orchestrator/contracts/gen/go/llm/v1"
 	"github.com/caduc/ai-agent-orchestrator/services/llm-gateway/internal/config"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type Client struct {
@@ -24,7 +25,7 @@ type Client struct {
 }
 
 func New(cfg config.Config) *Client {
-	return &Client{mode: cfg.Provider, baseURL: strings.TrimRight(cfg.BaseURL, "/"), apiKey: cfg.APIKey, model: cfg.Model, httpClient: &http.Client{Timeout: cfg.RequestTimeout}}
+	return &Client{mode: cfg.Provider, baseURL: strings.TrimRight(cfg.BaseURL, "/"), apiKey: cfg.APIKey, model: cfg.Model, httpClient: &http.Client{Timeout: cfg.RequestTimeout, Transport: otelhttp.NewTransport(http.DefaultTransport)}}
 }
 
 func (c *Client) Name() string  { return c.mode }

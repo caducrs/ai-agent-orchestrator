@@ -38,6 +38,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: services/orchestrator/go.sum
       - run: node --check web/app.js
       - run: docker compose config --quiet
+      - run: RUN_INTEGRATION_TESTS=1 GOWORK=off go test ./internal/store -run Integration
+        working-directory: services/orchestrator
       - run: docker compose build
