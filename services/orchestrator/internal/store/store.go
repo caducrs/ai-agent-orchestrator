@@ -34,13 +34,6 @@ func New(pool *pgxpool.Pool, subtaskTimeout time.Duration) *Store {
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("migrate orchestrator database: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) CreateTask(ctx context.Context, task domain.Task, keyHash, fingerprint string) (domain.Task, bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {

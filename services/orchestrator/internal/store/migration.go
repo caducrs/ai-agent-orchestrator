@@ -1,6 +1,87 @@
 package store
 
-const schemaSQL = `
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// migrationLockID serializes concurrent orchestrator replicas running migrations.
+const migrationLockID = 7_310_442_001
+
+// migration is a versioned schema change applied at most once per database.
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+// migrations must only be appended; applied versions are never edited.
+var migrations = []migration{
+	{version: 1, name: "baseline", sql: schemaV1},
+	{version: 2, name: "task_leases", sql: schemaV2},
+}
+
+// Migrate applies pending migrations in order. Each version runs in its own
+// transaction holding an advisory lock, so a failed version is never recorded
+// as applied and concurrent replicas cannot apply the same version twice.
+func (s *Store) Migrate(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version integer PRIMARY KEY,
+		name text NOT NULL,
+		applied_at timestamptz NOT NULL DEFAULT now()
+	)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	for _, item := range migrations {
+		if err := s.applyMigration(ctx, item); err != nil {
+			return fmt.Errorf("migrate orchestrator database to version %d (%s): %w", item.version, item.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) applyMigration(ctx context.Context, item migration) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLockID); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	var applied int
+	err = tx.QueryRow(ctx, `SELECT version FROM schema_migrations WHERE version=$1`, item.version).Scan(&applied)
+	if err == nil {
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check applied migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, item.sql); err != nil {
+		return fmt.Errorf("apply migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version,name) VALUES($1,$2)`, item.version, item.name); err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
+	}
+	return nil
+}
+
+// AppliedMigrations returns the versions recorded in schema_migrations.
+func (s *Store) AppliedMigrations(ctx context.Context) ([]int, error) {
+	rows, err := s.pool.Query(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return nil, fmt.Errorf("list applied migrations: %w", err)
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int])
+}
+
+const schemaV1 = `
 CREATE TABLE IF NOT EXISTS tasks (
     id text PRIMARY KEY,
     owner_subject text NOT NULL,
@@ -137,4 +218,11 @@ INSERT INTO agent_registry(id, agent_type, version, capabilities, status) VALUES
  ('database-agent', 'database', '1.0.0', '["database"]', 'HEALTHY'),
  ('infrastructure-agent', 'infrastructure', '1.0.0', '["infrastructure"]', 'HEALTHY')
 ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, capabilities = EXCLUDED.capabilities, updated_at = now();
+`
+
+const schemaV2 = `
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_owner text;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_until timestamptz;
+CREATE INDEX IF NOT EXISTS tasks_lease_idx ON tasks(status, lease_until);
+CREATE INDEX IF NOT EXISTS attempts_open_deadline_idx ON attempts(deadline_at) WHERE status = 'DISPATCHED';
 `
