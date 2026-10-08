@@ -73,3 +73,12 @@
   - Verify results from all four agent capabilities.
   - Scale Agent Services and verify healthy replicas and continued processing.
   - _Requirements: 5-16, 22-27_
+
+- [x] 12. Harden Orchestrator recovery
+  - Replace the bootstrap schema with versioned migrations serialized by a PostgreSQL advisory lock.
+  - Lease planning and aggregation so work interrupted by a crashed replica is resumed by any replica.
+  - Expire Attempts without results as `TIMEOUT` through the existing retry policy.
+  - Close Tasks past their total deadline, skipping unstarted work and aggregating confirmed results.
+  - Isolate panics per unit of work so planning, reconciliation and result workers keep running.
+  - Cover migrations, leases, Attempt timeouts and deadline closure with Testcontainers.
+  - _Requirements: 11, 13, 16, 23, 26, 27_

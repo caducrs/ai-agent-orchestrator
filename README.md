@@ -132,8 +132,10 @@ No service uses `container_name`, so Compose can create replicas. Worker concurr
 - ACK occurs only after local database commit.
 - Duplicate commands/results are absorbed by inbox and unique constraints.
 - Tool and task deadlines derive from cancellation-aware contexts.
-- Panics are contained at worker boundaries.
+- Panics are contained per unit of work, so planning, reconciliation and result workers keep running.
 - Terminal Task state rejects late results.
+- A reconciler (`RECONCILE_INTERVAL`, default `5s`) times out Attempts without results, closes Tasks past their total deadline and resumes planning (`PLANNING_LEASE`) or aggregation (`AGGREGATION_LEASE`) left behind by a crashed replica.
+- Schema changes are versioned migrations recorded in `schema_migrations` and serialized by an advisory lock.
 - Shutdown stops admission, drains work, persists recoverable state and closes producers before consumers.
 
 ## Tools and protections
