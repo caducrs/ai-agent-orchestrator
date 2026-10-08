@@ -176,7 +176,7 @@ Keys are passed at runtime and are not stored in source control.
 | GET | `/api/v1/agents` | `agents:read` |
 | GET | `/api/v1/health` | public operational check |
 
-See [docs/API.md](docs/API.md), [OpenAPI](contracts/openapi/v1/orchestrator.yaml) and [AsyncAPI](contracts/asyncapi/orchestrator.yaml).
+See [infra/docs/API.md](infra/docs/API.md), [OpenAPI](contracts/openapi/v1/orchestrator.yaml) and [AsyncAPI](contracts/asyncapi/orchestrator.yaml).
 
 ## Observability
 
