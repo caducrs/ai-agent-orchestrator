@@ -46,6 +46,11 @@ All external content is untrusted. LLM responses are proposals; deterministic va
 - Agent capability fails: independent branches continue and Task can be partially completed.
 - LLM aggregation fails: deterministic fallback preserves evidence.
 - Cancellation races with result: terminal state and current Attempt reject the late result.
+- Orchestrator crashes while planning: the planning lease expires and any replica reclaims the Task; a stale planner can no longer persist its plan.
+- Orchestrator crashes while aggregating: the aggregation lease expires and the reconciler resumes aggregation; completion is idempotent.
+- Result never arrives: after the Attempt deadline plus `ATTEMPT_RESULT_GRACE` the reconciler records `TIMEOUT` and applies the same retry policy as an agent-reported failure.
+- Task exceeds its total deadline: unstarted Subtasks are skipped, in-flight Attempts time out and the DAG closes so confirmed evidence is still aggregated.
+- Replicas start concurrently: versioned migrations run under a PostgreSQL advisory lock and a failed version is never recorded as applied.
 
 ## Scaling
 

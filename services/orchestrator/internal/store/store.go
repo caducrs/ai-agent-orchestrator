@@ -34,13 +34,6 @@ func New(pool *pgxpool.Pool, subtaskTimeout time.Duration) *Store {
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("migrate orchestrator database: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) CreateTask(ctx context.Context, task domain.Task, keyHash, fingerprint string) (domain.Task, bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -182,20 +175,25 @@ func (s *Store) CancelTask(ctx context.Context, taskID string) (domain.Task, err
 	return s.GetTask(ctx, taskID)
 }
 
-func (s *Store) ClaimQueuedTask(ctx context.Context) (*domain.Task, error) {
+// ClaimQueuedTask moves the oldest queued Task to PLANNING under a lease held
+// by owner. A PLANNING Task whose lease expired (its planner crashed before
+// persisting the plan) is reclaimed without repeating the state transition.
+func (s *Store) ClaimQueuedTask(ctx context.Context, owner string, lease time.Duration) (*domain.Task, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin claim queued task: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var task domain.Task
+	var status string
 	err = tx.QueryRow(ctx, `
-		SELECT id, owner_subject, description, created_at, updated_at, deadline_at
+		SELECT id, owner_subject, description, status, created_at, updated_at, deadline_at
 		FROM tasks
-		WHERE status='QUEUED' AND cancel_requested_at IS NULL
+		WHERE (status='QUEUED' AND cancel_requested_at IS NULL)
+		   OR (status='PLANNING' AND lease_until < now())
 		ORDER BY created_at
 		FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(
-		&task.ID, &task.OwnerSubject, &task.Description, &task.CreatedAt, &task.UpdatedAt, &task.DeadlineAt,
+		&task.ID, &task.OwnerSubject, &task.Description, &status, &task.CreatedAt, &task.UpdatedAt, &task.DeadlineAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -203,10 +201,16 @@ func (s *Store) ClaimQueuedTask(ctx context.Context) (*domain.Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("select queued task: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE tasks SET status='PLANNING', updated_at=now(), version=version+1 WHERE id=$1`, task.ID); err != nil {
+	if _, err = tx.Exec(ctx, `
+		UPDATE tasks SET status='PLANNING', lease_owner=$2, lease_until=now()+$3*interval '1 millisecond', updated_at=now(), version=version+1
+		WHERE id=$1`, task.ID, owner, lease.Milliseconds()); err != nil {
 		return nil, fmt.Errorf("mark task planning: %w", err)
 	}
-	if _, err = s.appendEventTx(ctx, tx, task.ID, "task.planning", map[string]any{"status": domain.TaskPlanning}); err != nil {
+	eventType := "task.planning"
+	if domain.TaskStatus(status) == domain.TaskPlanning {
+		eventType = "task.planning_resumed"
+	}
+	if _, err = s.appendEventTx(ctx, tx, task.ID, eventType, map[string]any{"status": domain.TaskPlanning}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -216,17 +220,19 @@ func (s *Store) ClaimQueuedTask(ctx context.Context) (*domain.Task, error) {
 	return &task, nil
 }
 
-func (s *Store) SavePlan(ctx context.Context, taskID string, plan []domain.PlannedSubtask) error {
+// SavePlan persists the plan and moves the Task to RUNNING. It returns
+// ErrConflict when the Task left PLANNING or another planner owns the lease.
+func (s *Store) SavePlan(ctx context.Context, taskID, owner string, plan []domain.PlannedSubtask) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin save plan: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status); err != nil {
+	var status, leaseOwner string
+	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(lease_owner,'') FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &leaseOwner); err != nil {
 		return fmt.Errorf("lock task for plan: %w", err)
 	}
-	if status != string(domain.TaskPlanning) {
+	if status != string(domain.TaskPlanning) || leaseOwner != owner {
 		return ErrConflict
 	}
 	planRaw, err := marshal(plan)
@@ -259,7 +265,7 @@ func (s *Store) SavePlan(ctx context.Context, taskID string, plan []domain.Plann
 			}
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE tasks SET status='RUNNING', updated_at=now(), version=version+1 WHERE id=$1`, taskID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE tasks SET status='RUNNING', lease_owner=NULL, lease_until=NULL, updated_at=now(), version=version+1 WHERE id=$1`, taskID); err != nil {
 		return fmt.Errorf("mark task running: %w", err)
 	}
 	if _, err = s.appendEventTx(ctx, tx, taskID, "task.running", map[string]any{"status": domain.TaskRunning, "subtasks": len(plan)}); err != nil {
@@ -278,19 +284,30 @@ func (s *Store) SavePlan(ctx context.Context, taskID string, plan []domain.Plann
 	return nil
 }
 
-func (s *Store) FailPlanning(ctx context.Context, taskID, code string) error {
+// FailPlanning moves a PLANNING Task owned by owner to FAILED. It is a no-op
+// when the Task already left PLANNING or the lease moved to another planner.
+func (s *Store) FailPlanning(ctx context.Context, taskID, owner, code string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin fail planning: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err = tx.Exec(ctx, `UPDATE tasks SET status='FAILED',error_code=$2,updated_at=now(),version=version+1 WHERE id=$1 AND status='PLANNING'`, taskID, code); err != nil {
+	tag, err := tx.Exec(ctx, `
+		UPDATE tasks SET status='FAILED',error_code=$3,lease_owner=NULL,lease_until=NULL,updated_at=now(),version=version+1
+		WHERE id=$1 AND status='PLANNING' AND lease_owner=$2`, taskID, owner, code)
+	if err != nil {
 		return fmt.Errorf("fail planning: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	if _, err = s.appendEventTx(ctx, tx, taskID, "task.failed", map[string]any{"status": domain.TaskFailed, "error_code": code}); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit fail planning: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) PendingOutbox(ctx context.Context, limit int) ([]OutboxMessage, error) {
@@ -337,20 +354,14 @@ func (s *Store) ApplyAgentResult(ctx context.Context, messageID string, payload 
 		return false, nil
 	}
 
-	var taskStatus, subtaskStatus, currentAttempt, capability, description string
-	var attemptNumber, maxAttempts, timeoutSeconds int32
-	err = tx.QueryRow(ctx, `
-		SELECT t.status,s.status,COALESCE(s.current_attempt_id,''),s.attempt,s.max_attempts,s.capability,s.description,s.timeout_seconds
-		FROM subtasks s JOIN tasks t ON t.id=s.task_id
-		WHERE s.id=$1 AND s.task_id=$2 FOR UPDATE OF s,t`, incoming.SubtaskID, incoming.TaskID).Scan(&taskStatus, &subtaskStatus, &currentAttempt, &attemptNumber, &maxAttempts, &capability, &description, &timeoutSeconds)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, ErrNotFound
-	}
+	target, err := s.lockAttemptTargetTx(ctx, tx, incoming.TaskID, incoming.SubtaskID)
 	if err != nil {
-		return false, fmt.Errorf("lock result target: %w", err)
+		return false, err
 	}
-	if domain.IsTaskTerminal(domain.TaskStatus(taskStatus)) || currentAttempt != incoming.AttemptID || domain.IsSubtaskTerminal(domain.SubtaskStatus(subtaskStatus)) {
-		_, _ = tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer='orchestrator-results' AND message_id=$1`, messageID)
+	if _, err = tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer='orchestrator-results' AND message_id=$1`, messageID); err != nil {
+		return false, fmt.Errorf("complete inbox message: %w", err)
+	}
+	if !target.accepts(incoming.AttemptID) {
 		return false, tx.Commit(ctx)
 	}
 
@@ -366,44 +377,11 @@ func (s *Store) ApplyAgentResult(ctx context.Context, messageID string, payload 
 	if _, err = tx.Exec(ctx, `INSERT INTO normalized_results(attempt_id,result,result_hash) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, incoming.AttemptID, resultRaw, hex.EncodeToString(hash[:])); err != nil {
 		return false, fmt.Errorf("insert normalized result: %w", err)
 	}
-	newStatus := domain.SubtaskSucceeded
-	attemptStatus := "SUCCEEDED"
+	outcome := attemptOutcome{attemptID: incoming.AttemptID, agentType: incoming.AgentType, attemptStatus: "SUCCEEDED", success: incoming.Success, errorCode: incoming.ErrorCode, result: resultRaw}
 	if !incoming.Success {
-		newStatus = domain.SubtaskFailed
-		attemptStatus = "FAILED"
+		outcome.attemptStatus = "FAILED"
 	}
-	if _, err = tx.Exec(ctx, `UPDATE attempts SET status=$2,error_code=$3,finished_at=now() WHERE id=$1`, incoming.AttemptID, attemptStatus, incoming.ErrorCode); err != nil {
-		return false, fmt.Errorf("finish attempt: %w", err)
-	}
-	if !incoming.Success && isTransientFailure(incoming.ErrorCode) && attemptNumber < maxAttempts {
-		if _, err = tx.Exec(ctx, `UPDATE subtasks SET status='READY',result=NULL,error_code=$2,updated_at=now() WHERE id=$1`, incoming.SubtaskID, incoming.ErrorCode); err != nil {
-			return false, fmt.Errorf("schedule subtask retry: %w", err)
-		}
-		if _, err = s.appendEventTx(ctx, tx, incoming.TaskID, "subtask.retry_scheduled", map[string]any{"subtask_id": incoming.SubtaskID, "attempt": attemptNumber + 1, "error_code": incoming.ErrorCode}); err != nil {
-			return false, err
-		}
-		if err := s.dispatchTx(ctx, tx, incoming.TaskID, incoming.SubtaskID, capability, description, timeoutSeconds); err != nil {
-			return false, err
-		}
-		if _, err = tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer='orchestrator-results' AND message_id=$1`, messageID); err != nil {
-			return false, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("commit subtask retry: %w", err)
-		}
-		return false, nil
-	}
-	if _, err = tx.Exec(ctx, `UPDATE subtasks SET status=$2,result=$3,error_code=$4,updated_at=now() WHERE id=$1`, incoming.SubtaskID, newStatus, resultRaw, incoming.ErrorCode); err != nil {
-		return false, fmt.Errorf("finish subtask: %w", err)
-	}
-	if _, err = s.appendEventTx(ctx, tx, incoming.TaskID, "subtask.completed", map[string]any{"subtask_id": incoming.SubtaskID, "status": newStatus, "agent_type": incoming.AgentType}); err != nil {
-		return false, err
-	}
-	if _, err = tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer='orchestrator-results' AND message_id=$1`, messageID); err != nil {
-		return false, err
-	}
-
-	aggregate, err := s.scheduleAndCloseTx(ctx, tx, incoming.TaskID)
+	aggregate, err := s.finishAttemptTx(ctx, tx, target, outcome)
 	if err != nil {
 		return false, err
 	}
@@ -411,6 +389,79 @@ func (s *Store) ApplyAgentResult(ctx context.Context, messageID string, payload 
 		return false, fmt.Errorf("commit agent result: %w", err)
 	}
 	return aggregate, nil
+}
+
+// attemptTarget is the locked Task and Subtask state an Attempt outcome applies to.
+type attemptTarget struct {
+	taskID, subtaskID                           string
+	taskStatus, subtaskStatus, currentAttemptID string
+	capability, description                     string
+	attemptNumber, maxAttempts, timeoutSeconds  int32
+}
+
+// accepts reports whether an outcome of attemptID may still change the Subtask;
+// outcomes of superseded Attempts or of terminal Tasks are Late_Results.
+func (t attemptTarget) accepts(attemptID string) bool {
+	return !domain.IsTaskTerminal(domain.TaskStatus(t.taskStatus)) &&
+		!domain.IsSubtaskTerminal(domain.SubtaskStatus(t.subtaskStatus)) &&
+		t.currentAttemptID == attemptID
+}
+
+// attemptOutcome is the classified end of one Attempt.
+type attemptOutcome struct {
+	attemptID, agentType, attemptStatus, errorCode string
+	success                                        bool
+	result                                         []byte
+}
+
+func (s *Store) lockAttemptTargetTx(ctx context.Context, tx pgx.Tx, taskID, subtaskID string) (attemptTarget, error) {
+	target := attemptTarget{taskID: taskID, subtaskID: subtaskID}
+	err := tx.QueryRow(ctx, `
+		SELECT t.status,s.status,COALESCE(s.current_attempt_id,''),s.attempt,s.max_attempts,s.capability,s.description,s.timeout_seconds
+		FROM subtasks s JOIN tasks t ON t.id=s.task_id
+		WHERE s.id=$1 AND s.task_id=$2 FOR UPDATE OF s,t`, subtaskID, taskID).Scan(
+		&target.taskStatus, &target.subtaskStatus, &target.currentAttemptID, &target.attemptNumber,
+		&target.maxAttempts, &target.capability, &target.description, &target.timeoutSeconds)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return attemptTarget{}, ErrNotFound
+	}
+	if err != nil {
+		return attemptTarget{}, fmt.Errorf("lock attempt target: %w", err)
+	}
+	return target, nil
+}
+
+// finishAttemptTx records the outcome, schedules a retry for transient
+// failures with Attempts left, or finishes the Subtask and advances the DAG.
+// It reports whether the Task reached DAG closure and must be aggregated.
+func (s *Store) finishAttemptTx(ctx context.Context, tx pgx.Tx, target attemptTarget, outcome attemptOutcome) (bool, error) {
+	if _, err := tx.Exec(ctx, `UPDATE attempts SET status=$2,error_code=$3,finished_at=now() WHERE id=$1`, outcome.attemptID, outcome.attemptStatus, outcome.errorCode); err != nil {
+		return false, fmt.Errorf("finish attempt: %w", err)
+	}
+	if !outcome.success && isTransientFailure(outcome.errorCode) && target.attemptNumber < target.maxAttempts {
+		if _, err := tx.Exec(ctx, `UPDATE subtasks SET status='READY',result=NULL,error_code=$2,updated_at=now() WHERE id=$1`, target.subtaskID, outcome.errorCode); err != nil {
+			return false, fmt.Errorf("schedule subtask retry: %w", err)
+		}
+		if _, err := s.appendEventTx(ctx, tx, target.taskID, "subtask.retry_scheduled", map[string]any{"subtask_id": target.subtaskID, "attempt": target.attemptNumber + 1, "error_code": outcome.errorCode}); err != nil {
+			return false, err
+		}
+		return false, s.dispatchTx(ctx, tx, target.taskID, target.subtaskID, target.capability, target.description, target.timeoutSeconds)
+	}
+	newStatus := domain.SubtaskSucceeded
+	if !outcome.success {
+		newStatus = domain.SubtaskFailed
+	}
+	if _, err := tx.Exec(ctx, `UPDATE subtasks SET status=$2,result=$3,error_code=$4,updated_at=now() WHERE id=$1`, target.subtaskID, newStatus, outcome.result, outcome.errorCode); err != nil {
+		return false, fmt.Errorf("finish subtask: %w", err)
+	}
+	payload := map[string]any{"subtask_id": target.subtaskID, "status": newStatus, "agent_type": outcome.agentType}
+	if outcome.errorCode != "" {
+		payload["error_code"] = outcome.errorCode
+	}
+	if _, err := s.appendEventTx(ctx, tx, target.taskID, "subtask.completed", payload); err != nil {
+		return false, err
+	}
+	return s.scheduleAndCloseTx(ctx, tx, target.taskID)
 }
 
 func (s *Store) CompleteTask(ctx context.Context, taskID string, result domain.FinalResult) error {
@@ -430,14 +481,22 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, result domain.F
 		return ErrConflict
 	}
 	var successes, failures int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='SUCCEEDED'), count(*) FILTER (WHERE status IN ('FAILED','SKIPPED','CANCELLED')) FROM subtasks WHERE task_id=$1`, taskID).Scan(&successes, &failures); err != nil {
-		return err
+	var deadlineExceeded bool
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE s.status='SUCCEEDED'),
+		       count(*) FILTER (WHERE s.status IN ('FAILED','SKIPPED','CANCELLED')),
+		       COALESCE(bool_or(s.error_code='TASK_DEADLINE_EXCEEDED'), false)
+		FROM subtasks s WHERE s.task_id=$1`, taskID).Scan(&successes, &failures, &deadlineExceeded); err != nil {
+		return fmt.Errorf("count subtask outcomes: %w", err)
 	}
 	finalStatus := domain.TaskCompleted
 	errorCode := ""
 	if successes == 0 {
 		finalStatus = domain.TaskFailed
 		errorCode = "NO_USEFUL_RESULT"
+		if deadlineExceeded {
+			errorCode = "TASK_DEADLINE_EXCEEDED"
+		}
 	} else if failures > 0 {
 		finalStatus = domain.TaskPartiallyCompleted
 	}
@@ -571,38 +630,45 @@ func (s *Store) scheduleAndCloseTx(ctx context.Context, tx pgx.Tx, taskID string
 	}
 	rows.Close()
 
-	for _, item := range items {
-		if item.status != string(domain.SubtaskBlocked) {
-			continue
-		}
-		allSucceeded := true
-		failedDependency := ""
-		for _, dependency := range item.dependencies {
-			status := domain.SubtaskStatus(statusByID[dependency])
-			if status == domain.SubtaskFailed || status == domain.SubtaskSkipped || status == domain.SubtaskCancelled {
-				failedDependency = dependency
-				break
+	// Repeat until a fixpoint so a skip propagates transitively regardless of
+	// the order in which Subtasks were planned.
+	for changed := true; changed; {
+		changed = false
+		for _, item := range items {
+			if statusByID[item.id] != string(domain.SubtaskBlocked) {
+				continue
 			}
-			if status != domain.SubtaskSucceeded {
-				allSucceeded = false
+			allSucceeded := true
+			failedDependency := ""
+			for _, dependency := range item.dependencies {
+				status := domain.SubtaskStatus(statusByID[dependency])
+				if status == domain.SubtaskFailed || status == domain.SubtaskSkipped || status == domain.SubtaskCancelled {
+					failedDependency = dependency
+					break
+				}
+				if status != domain.SubtaskSucceeded {
+					allSucceeded = false
+				}
 			}
-		}
-		if failedDependency != "" {
-			if _, err := tx.Exec(ctx, `UPDATE subtasks SET status='SKIPPED',error_code='DEPENDENCY_FAILED',updated_at=now() WHERE id=$1 AND status='BLOCKED'`, item.id); err != nil {
-				return false, err
+			if failedDependency != "" {
+				if _, err := tx.Exec(ctx, `UPDATE subtasks SET status='SKIPPED',error_code='DEPENDENCY_FAILED',updated_at=now() WHERE id=$1 AND status='BLOCKED'`, item.id); err != nil {
+					return false, fmt.Errorf("skip subtask %s: %w", item.id, err)
+				}
+				statusByID[item.id] = string(domain.SubtaskSkipped)
+				changed = true
+				if _, err := s.appendEventTx(ctx, tx, taskID, "subtask.skipped", map[string]any{"subtask_id": item.id, "dependency_id": failedDependency}); err != nil {
+					return false, err
+				}
+			} else if allSucceeded {
+				if _, err := tx.Exec(ctx, `UPDATE subtasks SET status='READY',updated_at=now() WHERE id=$1 AND status='BLOCKED'`, item.id); err != nil {
+					return false, fmt.Errorf("unblock subtask %s: %w", item.id, err)
+				}
+				if err := s.dispatchTx(ctx, tx, taskID, item.id, item.capability, item.description, item.timeout); err != nil {
+					return false, err
+				}
+				statusByID[item.id] = string(domain.SubtaskRunning)
+				changed = true
 			}
-			statusByID[item.id] = string(domain.SubtaskSkipped)
-			if _, err := s.appendEventTx(ctx, tx, taskID, "subtask.skipped", map[string]any{"subtask_id": item.id, "dependency_id": failedDependency}); err != nil {
-				return false, err
-			}
-		} else if allSucceeded {
-			if _, err := tx.Exec(ctx, `UPDATE subtasks SET status='READY',updated_at=now() WHERE id=$1 AND status='BLOCKED'`, item.id); err != nil {
-				return false, err
-			}
-			if err := s.dispatchTx(ctx, tx, taskID, item.id, item.capability, item.description, item.timeout); err != nil {
-				return false, err
-			}
-			statusByID[item.id] = string(domain.SubtaskRunning)
 		}
 	}
 
@@ -611,7 +677,7 @@ func (s *Store) scheduleAndCloseTx(ctx context.Context, tx pgx.Tx, taskID string
 		return false, err
 	}
 	if total > 0 && total == terminal {
-		tag, err := tx.Exec(ctx, `UPDATE tasks SET status='AGGREGATING',updated_at=now(),version=version+1 WHERE id=$1 AND status='RUNNING'`, taskID)
+		tag, err := tx.Exec(ctx, `UPDATE tasks SET status='AGGREGATING',lease_owner=NULL,lease_until=NULL,updated_at=now(),version=version+1 WHERE id=$1 AND status='RUNNING'`, taskID)
 		if err != nil {
 			return false, err
 		}
