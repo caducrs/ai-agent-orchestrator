@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ func (r *Runtime) Start(ctx context.Context) error {
 
 	r.goSafe(ctx, "planning-loop", r.planningLoop)
 	r.goSafe(ctx, "outbox-loop", r.outboxLoop)
+	r.goSafe(ctx, "reconcile-loop", r.reconcileLoop)
 	r.startResultWorkers(ctx, resultSubscription)
 	return nil
 }
@@ -63,11 +65,24 @@ func (r *Runtime) goSafe(ctx context.Context, name string, function func(context
 		defer r.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				r.logger.Error("runtime panic recovered", "component", name, "panic", recovered)
+				r.logger.Error("runtime panic recovered", "component", name, "panic", recovered, "stack", string(debug.Stack()))
 			}
 		}()
 		function(ctx)
 	}()
+}
+
+// safely runs one unit of work and converts a panic into an error, so a
+// failing unit cannot terminate the long-lived loop or worker that runs it.
+func (r *Runtime) safely(ctx context.Context, unit string, function func(context.Context)) (failed bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			failed = true
+			r.logger.ErrorContext(ctx, "unit of work panicked", "unit", unit, "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+		}
+	}()
+	function(ctx)
+	return false
 }
 
 func (r *Runtime) ensureStreams() error {
@@ -92,7 +107,7 @@ func (r *Runtime) planningLoop(ctx context.Context) {
 	ticker := time.NewTicker(r.cfg.SchedulerInterval)
 	defer ticker.Stop()
 	for {
-		r.processOnePlanningTask(ctx)
+		r.safely(ctx, "plan-task", r.processOnePlanningTask)
 		select {
 		case <-ctx.Done():
 			return
@@ -102,7 +117,8 @@ func (r *Runtime) planningLoop(ctx context.Context) {
 }
 
 func (r *Runtime) processOnePlanningTask(ctx context.Context) {
-	task, err := r.store.ClaimQueuedTask(ctx)
+	owner := r.cfg.InstanceID
+	task, err := r.store.ClaimQueuedTask(ctx, owner, r.cfg.PlanningLease)
 	if err != nil {
 		if ctx.Err() == nil {
 			r.logger.ErrorContext(ctx, "claim queued task failed", "error", err)
@@ -114,6 +130,10 @@ func (r *Runtime) processOnePlanningTask(ctx context.Context) {
 	}
 	ctx, span := otel.Tracer("orchestrator.runtime").Start(ctx, "task.plan", trace.WithAttributes(attribute.String("task.id", task.ID)))
 	defer span.End()
+	if !time.Now().Before(task.DeadlineAt) {
+		r.failPlanning(ctx, task.ID, "TASK_DEADLINE_EXCEEDED")
+		return
+	}
 	planningCtx, cancel := context.WithDeadline(ctx, minTime(task.DeadlineAt, time.Now().Add(45*time.Second)))
 	defer cancel()
 	_, _ = r.llm.OpenTaskBudget(planningCtx, &llmv1.OpenTaskBudgetRequest{TaskId: task.ID, MaxTokens: 100_000})
@@ -124,7 +144,7 @@ func (r *Runtime) processOnePlanningTask(ctx context.Context) {
 	})
 	if err != nil {
 		r.logger.ErrorContext(ctx, "task planning failed", "task_id", task.ID, "error", err)
-		_ = r.store.FailPlanning(ctx, task.ID, "LLM_UNAVAILABLE")
+		r.failPlanning(ctx, task.ID, "LLM_UNAVAILABLE")
 		return
 	}
 	plan := make([]domain.PlannedSubtask, 0, len(response.GetSubtasks()))
@@ -149,16 +169,90 @@ func (r *Runtime) processOnePlanningTask(ctx context.Context) {
 	capabilities := map[string]bool{"code": true, "logs": true, "database": true, "infrastructure": true}
 	if err := domain.ValidatePlan(plan, r.cfg.MaxSubtasks, capabilities); err != nil {
 		r.logger.ErrorContext(ctx, "LLM returned invalid plan", "task_id", task.ID, "error", err)
-		_ = r.store.FailPlanning(ctx, task.ID, "PLAN_INVALID")
+		r.failPlanning(ctx, task.ID, "PLAN_INVALID")
 		return
 	}
-	if err := r.store.SavePlan(ctx, task.ID, plan); err != nil {
+	if err := r.store.SavePlan(ctx, task.ID, owner, plan); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			// Cancellation, deadline expiry or a planner that reclaimed an
+			// expired lease already decided this Task; this plan is stale.
+			r.logger.WarnContext(ctx, "discarding stale execution plan", "task_id", task.ID)
+			return
+		}
 		r.logger.ErrorContext(ctx, "persist execution plan failed", "task_id", task.ID, "error", err)
-		_ = r.store.FailPlanning(ctx, task.ID, "PLAN_PERSISTENCE_FAILED")
+		r.failPlanning(ctx, task.ID, "PLAN_PERSISTENCE_FAILED")
 		return
 	}
 	span.SetStatus(codes.Ok, "plan persisted")
 	r.logger.InfoContext(ctx, "task plan dispatched", "task_id", task.ID, "subtasks", len(plan))
+}
+
+func (r *Runtime) failPlanning(ctx context.Context, taskID, code string) {
+	if err := r.store.FailPlanning(ctx, taskID, r.cfg.InstanceID, code); err != nil {
+		r.logger.ErrorContext(ctx, "fail planning task failed", "task_id", taskID, "error_code", code, "error", err)
+	}
+}
+
+// reconcileLoop recovers work that no event will advance: Tasks past their
+// total deadline, Attempts whose result never arrived and aggregations whose
+// owner stopped. Every step is idempotent and safe across replicas.
+func (r *Runtime) reconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(r.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		r.safely(ctx, "reconcile", r.reconcileOnce)
+	}
+}
+
+// reconcileBatch bounds the work of one reconciliation tick.
+const reconcileBatch = 50
+
+func (r *Runtime) reconcileOnce(ctx context.Context) {
+	r.drain(ctx, "expire task deadline", func(ctx context.Context) (bool, string, error) {
+		return r.store.ExpireTaskDeadline(ctx)
+	})
+	r.drain(ctx, "expire overdue attempt", func(ctx context.Context) (bool, string, error) {
+		return r.store.ExpireOverdueAttempt(ctx, r.cfg.AttemptResultGrace)
+	})
+	for range reconcileBatch {
+		taskID, err := r.store.ClaimStaleAggregation(ctx, r.cfg.InstanceID, r.cfg.AggregationLease)
+		if err != nil {
+			if ctx.Err() == nil {
+				r.logger.ErrorContext(ctx, "claim stale aggregation failed", "error", err)
+			}
+			return
+		}
+		if taskID == "" {
+			return
+		}
+		r.logger.WarnContext(ctx, "resuming interrupted aggregation", "task_id", taskID)
+		r.runAggregation(ctx, taskID)
+	}
+}
+
+// drain repeats one recovery step until it finds nothing or the batch ends,
+// aggregating every Task whose DAG the step closed.
+func (r *Runtime) drain(ctx context.Context, name string, step func(context.Context) (bool, string, error)) {
+	for range reconcileBatch {
+		found, aggregateTaskID, err := step(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				r.logger.ErrorContext(ctx, name+" failed", "error", err)
+			}
+			return
+		}
+		if !found {
+			return
+		}
+		if aggregateTaskID != "" {
+			r.aggregateTask(ctx, aggregateTaskID)
+		}
+	}
 }
 
 func (r *Runtime) outboxLoop(ctx context.Context) {
@@ -230,7 +324,9 @@ func (r *Runtime) startResultWorkers(ctx context.Context, subscription *nats.Sub
 					if !ok {
 						return
 					}
-					r.handleResult(ctx, message)
+					if r.safely(ctx, "apply-result", func(ctx context.Context) { r.handleResult(ctx, message) }) {
+						_ = message.NakWithDelay(time.Second)
+					}
 				}
 			}
 		})
@@ -277,7 +373,22 @@ func (r *Runtime) handleResult(ctx context.Context, message *nats.Msg) {
 	}
 }
 
+// aggregateTask aggregates a Task whose DAG closed, unless another replica
+// already holds its aggregation lease.
 func (r *Runtime) aggregateTask(ctx context.Context, taskID string) {
+	claimed, err := r.store.ClaimAggregation(ctx, taskID, r.cfg.InstanceID, r.cfg.AggregationLease)
+	if err != nil {
+		r.logger.ErrorContext(ctx, "claim aggregation failed", "task_id", taskID, "error", err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	r.runAggregation(ctx, taskID)
+}
+
+// runAggregation produces and persists the Final_Result of a leased Task.
+func (r *Runtime) runAggregation(ctx context.Context, taskID string) {
 	ctx, span := otel.Tracer("orchestrator.runtime").Start(ctx, "task.aggregate", trace.WithAttributes(attribute.String("task.id", taskID)))
 	defer span.End()
 	task, err := r.store.GetTask(ctx, taskID)

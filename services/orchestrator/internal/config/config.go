@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Config struct {
@@ -22,6 +24,11 @@ type Config struct {
 	LocalDevelopment    bool
 	StartupTimeout      time.Duration
 	ShutdownGracePeriod time.Duration
+	InstanceID          string
+	ReconcileInterval   time.Duration
+	PlanningLease       time.Duration
+	AggregationLease    time.Duration
+	AttemptResultGrace  time.Duration
 }
 
 func Load() (Config, error) {
@@ -40,6 +47,11 @@ func Load() (Config, error) {
 		LocalDevelopment:    boolean("LOCAL_DEVELOPMENT_MODE", false),
 		StartupTimeout:      duration("STARTUP_TIMEOUT", 30*time.Second),
 		ShutdownGracePeriod: duration("SHUTDOWN_GRACE_PERIOD", 30*time.Second),
+		InstanceID:          env("INSTANCE_ID", defaultInstanceID()),
+		ReconcileInterval:   duration("RECONCILE_INTERVAL", 5*time.Second),
+		PlanningLease:       duration("PLANNING_LEASE", 2*time.Minute),
+		AggregationLease:    duration("AGGREGATION_LEASE", 2*time.Minute),
+		AttemptResultGrace:  duration("ATTEMPT_RESULT_GRACE", 30*time.Second),
 	}
 	if cfg.MaxSubtasks < 1 || cfg.MaxSubtasks > 256 {
 		return Config{}, fmt.Errorf("MAX_SUBTASKS must be between 1 and 256")
@@ -51,12 +63,24 @@ func Load() (Config, error) {
 		"TASK_TIMEOUT": cfg.TaskTimeout, "SUBTASK_TIMEOUT": cfg.SubtaskTimeout,
 		"SCHEDULER_INTERVAL": cfg.SchedulerInterval, "OUTBOX_INTERVAL": cfg.OutboxInterval,
 		"STARTUP_TIMEOUT": cfg.StartupTimeout, "SHUTDOWN_GRACE_PERIOD": cfg.ShutdownGracePeriod,
+		"RECONCILE_INTERVAL": cfg.ReconcileInterval, "PLANNING_LEASE": cfg.PlanningLease,
+		"AGGREGATION_LEASE": cfg.AggregationLease, "ATTEMPT_RESULT_GRACE": cfg.AttemptResultGrace,
 	} {
 		if value <= 0 {
 			return Config{}, fmt.Errorf("%s must be positive", name)
 		}
 	}
 	return cfg, nil
+}
+
+// defaultInstanceID identifies this replica as lease owner; the random suffix
+// keeps restarted containers with a reused hostname from inheriting leases.
+func defaultInstanceID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "orchestrator"
+	}
+	return host + "-" + uuid.NewString()
 }
 
 func env(name, fallback string) string {
